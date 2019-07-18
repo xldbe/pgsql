@@ -1,0 +1,215 @@
+SELECT now();
+
+CREATE TEMP TABLE tmp_history_clean_data AS
+
+SELECT DISTINCT
+mn_code,data_time,state,
+CASE WHEN tp_avg_flag in ('A','Q','N') THEN tp_avg ELSE NULL END                 AS tp_avg,
+CASE WHEN do_avg_flag in ('A','Q','N') THEN do_avg ELSE NULL END                 AS do_avg,
+CASE WHEN codmn_avg_flag in ('A','Q','N') THEN codmn_avg ELSE NULL END           AS codmn_avg,
+CASE WHEN nh3n_avg_flag in ('A','Q','N') THEN nh3n_avg ELSE NULL END             AS nh3n_avg,
+CASE WHEN water_temp_avg_flag in ('A','Q','N') THEN water_temp_avg ELSE NULL END AS water_temp_avg
+FROM (
+SELECT
+       data_value->'msgData'->>'mn'                                   AS mn_code,
+       (data_value->'msgData'->'cp'->>'dataTime')::TIMESTAMP          AS data_time,
+       (data_value->'msgData'->'cp'->'avg'->>'060')::NUMERIC(21,7)    AS nh3n_avg,              --氨氮	mg/l
+       (data_value->'msgData'->'cp'->'avg'->>'101')::NUMERIC(21,7)    AS tp_avg,                --总磷	mg/l
+       (data_value->'msgData'->'cp'->'avg'->>'W01')::NUMERIC(21,7)    AS water_temp_avg,        --水温	°C
+       (data_value->'msgData'->'cp'->'avg'->>'W02')::NUMERIC(21,7)    AS do_avg,                --溶解氧	mg/l
+       (data_value->'msgData'->'cp'->'avg'->>'W07')::NUMERIC(21,7)    AS codmn_avg,             --高锰酸盐指数
+       (data_value->'msgData'->'cp'->'flag'->>'060')::TEXT    AS nh3n_avg_flag,              --氨氮	mg/l
+       (data_value->'msgData'->'cp'->'flag'->>'101')::TEXT    AS tp_avg_flag,                --总磷	mg/l
+       (data_value->'msgData'->'cp'->'flag'->>'W01')::TEXT    AS water_temp_avg_flag,        --水温	°C
+       (data_value->'msgData'->'cp'->'flag'->>'W02')::TEXT    AS do_avg_flag,                --溶解氧	mg/l
+       (data_value->'msgData'->'cp'->'flag'->>'W07')::TEXT    AS codmn_avg_flag,             --高锰酸盐指数
+       0                                                              AS state                  --0在线,1离线
+FROM wdp.wdp_history_clean_json
+WHERE (data_value->'msgData'->'cp'->>'dataTime')::TIMESTAMP>=:'begin_time'
+  AND (data_value->'msgData'->'cp'->>'dataTime')::TIMESTAMP<=:'end_time'
+  AND substr(data_value->'msgData'->'cp'->>'dataTime',12,8) IN ('00:00:00','04:00:00','08:00:00','12:00:00','16:00:00','20:00:00')
+  ) a
+;
+
+--汇总到站点
+CREATE TEMP TABLE tmp_history_site_data AS
+SELECT a.data_time,
+       c.id                                                            AS site_id,
+       c.stm_number                                                    AS site_number,
+       c.stm_name                                                      AS site_name,
+       c.lat                                                           AS site_lat,
+       c.lng                                                           AS site_lng,
+       e.id                                                            AS river_id,
+       e.river_number                                                  AS river_number,
+       e.river_name                                                    AS river_name,
+       AVG(nh3n_avg)                                                   AS nh3n_avg,
+       AVG(tp_avg)                                                     AS tp_avg,
+       AVG(water_temp_avg)                                             AS water_temp_avg,
+       AVG(do_avg)                                                     AS do_avg,
+       AVG(codmn_avg)                                                  AS codmn_avg,
+       MAX(e.river_category)                                           AS river_category,
+       MAX(state)                                                      AS state
+FROM tmp_history_clean_data a
+INNER JOIN dms.dms_gateway b ON a.mn_code=b.mn AND b.is_deleted='N'
+INNER JOIN stm.stm_site c ON b.site_id=c.ID AND c.is_deleted='N'
+INNER JOIN river.river_site_relation d ON c.id=d.site_id AND d.is_deleted='N'
+INNER JOIN river.river_manager e ON d.river_id=e.id AND e.is_deleted='N' AND e.insert_by='1'
+WHERE a.mn_code LIKE '060%'
+GROUP BY a.data_time,c.id,c.stm_number,c.stm_name,c.lat,c.lng,e.id,e.river_number,e.river_name;
+
+--2.统计指标(超标率)
+CREATE TEMP TABLE tmp_site_index_data1 AS
+SELECT a.*,
+--exceed_multi
+       CASE WHEN nh3n_avg IS NULL OR nh3n_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN nh3n_avg <= nh3n_1 THEN 0 ELSE abs((nh3n_avg)/nh3n_1) END)
+            WHEN river_category=2 THEN (CASE WHEN nh3n_avg <= nh3n_2 THEN 0 ELSE abs((nh3n_avg)/nh3n_2) END)
+            WHEN river_category=3 THEN (CASE WHEN nh3n_avg <= nh3n_3 THEN 0 ELSE abs((nh3n_avg)/nh3n_3) END)
+            WHEN river_category=4 THEN (CASE WHEN nh3n_avg <= nh3n_4 THEN 0 ELSE abs((nh3n_avg)/nh3n_4) END)
+            WHEN river_category=5 THEN (CASE WHEN nh3n_avg <= nh3n_5 THEN 0 ELSE abs((nh3n_avg)/nh3n_5) END) END         AS nh3n_exceed_multi,
+       CASE WHEN tp_avg IS NULL OR tp_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN tp_avg <= tp_1 THEN 0 ELSE abs((tp_avg)/tp_1) END)
+            WHEN river_category=2 THEN (CASE WHEN tp_avg <= tp_2 THEN 0 ELSE abs((tp_avg)/tp_2) END)
+            WHEN river_category=3 THEN (CASE WHEN tp_avg <= tp_3 THEN 0 ELSE abs((tp_avg)/tp_3) END)
+            WHEN river_category=4 THEN (CASE WHEN tp_avg <= tp_4 THEN 0 ELSE abs((tp_avg)/tp_4) END)
+            WHEN river_category=5 THEN (CASE WHEN tp_avg <= tp_5 THEN 0 ELSE abs((tp_avg)/tp_5) END) END                 AS tp_exceed_multi,
+       CASE WHEN do_avg IS NULL OR do_avg = 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN do_avg >= do_1 THEN 0 ELSE abs(do_1/do_avg) END)
+            WHEN river_category=2 THEN (CASE WHEN do_avg >= do_2 THEN 0 ELSE abs(do_2/do_avg) END)
+            WHEN river_category=3 THEN (CASE WHEN do_avg >= do_3 THEN 0 ELSE abs(do_3/do_avg) END)
+            WHEN river_category=4 THEN (CASE WHEN do_avg >= do_4 THEN 0 ELSE abs(do_4/do_avg) END)
+            WHEN river_category=5 THEN (CASE WHEN do_avg >= do_5 THEN 0 ELSE abs(do_5/do_avg) END) END                 AS do_exceed_multi,
+       CASE WHEN codmn_avg IS NULL OR codmn_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN codmn_avg <= codmn_1 THEN 0 ELSE abs((codmn_avg)/codmn_1) END)
+            WHEN river_category=2 THEN (CASE WHEN codmn_avg <= codmn_2 THEN 0 ELSE abs((codmn_avg)/codmn_2) END)
+            WHEN river_category=3 THEN (CASE WHEN codmn_avg <= codmn_3 THEN 0 ELSE abs((codmn_avg)/codmn_3) END)
+            WHEN river_category=4 THEN (CASE WHEN codmn_avg <= codmn_4 THEN 0 ELSE abs((codmn_avg)/codmn_4) END)
+            WHEN river_category=5 THEN (CASE WHEN codmn_avg <= codmn_5 THEN 0 ELSE abs((codmn_avg)/codmn_5) END)  END AS codmn_exceed_multi,
+--exceed_rate
+       CASE WHEN nh3n_avg IS NULL OR nh3n_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN nh3n_avg <= nh3n_1 THEN 0 ELSE abs((nh3n_avg-nh3n_1)/nh3n_1) END)
+            WHEN river_category=2 THEN (CASE WHEN nh3n_avg <= nh3n_2 THEN 0 ELSE abs((nh3n_avg-nh3n_2)/nh3n_2) END)
+            WHEN river_category=3 THEN (CASE WHEN nh3n_avg <= nh3n_3 THEN 0 ELSE abs((nh3n_avg-nh3n_3)/nh3n_3) END)
+            WHEN river_category=4 THEN (CASE WHEN nh3n_avg <= nh3n_4 THEN 0 ELSE abs((nh3n_avg-nh3n_4)/nh3n_4) END)
+            WHEN river_category=5 THEN (CASE WHEN nh3n_avg <= nh3n_5 THEN 0 ELSE abs((nh3n_avg-nh3n_5)/nh3n_5) END) END  AS nh3n_exceed_rate,
+       CASE WHEN tp_avg IS NULL OR tp_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN tp_avg <= tp_1 THEN 0 ELSE abs((tp_avg-tp_1)/tp_1) END)
+            WHEN river_category=2 THEN (CASE WHEN tp_avg <= tp_2 THEN 0 ELSE abs((tp_avg-tp_2)/tp_2) END)
+            WHEN river_category=3 THEN (CASE WHEN tp_avg <= tp_3 THEN 0 ELSE abs((tp_avg-tp_3)/tp_3) END)
+            WHEN river_category=4 THEN (CASE WHEN tp_avg <= tp_4 THEN 0 ELSE abs((tp_avg-tp_4)/tp_4) END)
+            WHEN river_category=5 THEN (CASE WHEN tp_avg <= tp_5 THEN 0 ELSE abs((tp_avg-tp_5)/tp_5) END) END            AS tp_exceed_rate,
+       CASE WHEN do_avg IS NULL THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN do_avg >= do_1 THEN 0 ELSE abs((do_avg-do_1)/do_1) END)
+            WHEN river_category=2 THEN (CASE WHEN do_avg >= do_2 THEN 0 ELSE abs((do_avg-do_2)/do_2) END)
+            WHEN river_category=3 THEN (CASE WHEN do_avg >= do_3 THEN 0 ELSE abs((do_avg-do_3)/do_3) END)
+            WHEN river_category=4 THEN (CASE WHEN do_avg >= do_4 THEN 0 ELSE abs((do_avg-do_4)/do_4) END)
+            WHEN river_category=5 THEN (CASE WHEN do_avg >= do_5 THEN 0 ELSE abs((do_avg-do_5)/do_5) END) END            AS do_exceed_rate,
+       CASE WHEN codmn_avg IS NULL OR codmn_avg < 0 THEN NULL
+            WHEN river_category=1 THEN (CASE WHEN codmn_avg <= codmn_1 THEN 0 ELSE abs((codmn_avg-codmn_1)/codmn_1) END)
+            WHEN river_category=2 THEN (CASE WHEN codmn_avg <= codmn_2 THEN 0 ELSE abs((codmn_avg-codmn_2)/codmn_2) END)
+            WHEN river_category=3 THEN (CASE WHEN codmn_avg <= codmn_3 THEN 0 ELSE abs((codmn_avg-codmn_3)/codmn_3) END)
+            WHEN river_category=4 THEN (CASE WHEN codmn_avg <= codmn_4 THEN 0 ELSE abs((codmn_avg-codmn_4)/codmn_4) END)
+            WHEN river_category=5 THEN (CASE WHEN codmn_avg <= codmn_5 THEN 0 ELSE abs((codmn_avg-codmn_5)/codmn_5) END)  END AS codmn_exceed_rate,
+--actual_category
+       CASE WHEN nh3n_avg IS NULL OR nh3n_avg < 0 THEN NULL
+            WHEN nh3n_avg <= nh3n_1 THEN 1
+            WHEN nh3n_avg <= nh3n_2 THEN 2
+            WHEN nh3n_avg <= nh3n_3 THEN 3
+            WHEN nh3n_avg <= nh3n_4 THEN 4
+            WHEN nh3n_avg <= nh3n_5 THEN 5
+                                    ELSE 6 END AS actual_nh3n_category,
+       CASE WHEN tp_avg IS NULL OR tp_avg < 0 THEN NULL
+            WHEN tp_avg <= tp_1 THEN 1
+            WHEN tp_avg <= tp_2 THEN 2
+            WHEN tp_avg <= tp_3 THEN 3
+            WHEN tp_avg <= tp_4 THEN 4
+            WHEN tp_avg <= tp_5 THEN 5
+                                ELSE 6 END AS actual_tp_category,
+       CASE WHEN do_avg IS NULL THEN NULL
+            WHEN do_avg >= do_1 THEN 1
+            WHEN do_avg >= do_2 THEN 2
+            WHEN do_avg >= do_3 THEN 3
+            WHEN do_avg >= do_4 THEN 4
+            WHEN do_avg >= do_5 THEN 5
+                                ELSE 6 END AS actual_do_category,
+       CASE WHEN codmn_avg IS NULL OR codmn_avg < 0 THEN NULL
+            WHEN codmn_avg <= codmn_1 THEN 1
+            WHEN codmn_avg <= codmn_2 THEN 2
+            WHEN codmn_avg <= codmn_3 THEN 3
+            WHEN codmn_avg <= codmn_4 THEN 4
+            WHEN codmn_avg <= codmn_5 THEN 5
+                                      ELSE 6 END AS actual_codmn_category,
+--general_category
+       CASE WHEN nh3n_avg IS NULL OR nh3n_avg < 0 THEN NULL
+            ELSE wdp.f_cal_index_catalog('nh3n',nh3n_avg) END AS general_nh3n_category,--超过6等于6
+       CASE WHEN tp_avg IS NULL OR tp_avg < 0 THEN NULL
+            ELSE wdp.f_cal_index_catalog('tp',tp_avg) END AS general_tp_category,--超过6等于6
+       CASE WHEN do_avg IS NULL THEN NULL
+            ELSE wdp.f_cal_index_catalog('do',do_avg) END AS general_do_category,--超过6等于6
+       CASE WHEN codmn_avg IS NULL OR codmn_avg < 0 THEN NULL
+            ELSE wdp.f_cal_index_catalog('codmn',codmn_avg) END AS general_codmn_category--超过6等于6
+
+FROM tmp_history_site_data a
+CROSS JOIN wdp.water_class_parameter b;
+
+CREATE TEMP TABLE tmp_site_index_data2 AS 
+SELECT a.*,
+       CASE WHEN a.nh3n_exceed_rate>0            THEN 1 ELSE 0 END        AS nh3n_exceed,
+       CASE WHEN a.tp_exceed_rate>0              THEN 1 ELSE 0 END        AS tp_exceed,
+       CASE WHEN a.do_exceed_rate>0              THEN 1 ELSE 0 END        AS do_exceed,
+       CASE WHEN a.codmn_exceed_rate>0           THEN 1 ELSE 0 END        AS codmn_exceed,
+        CASE WHEN nh3n_avg IS NULL OR nh3n_avg < 0 THEN 0 ELSE 1 END          AS nh3n_multi_flag,
+        CASE WHEN tp_avg IS NULL OR tp_avg < 0 THEN 0 ELSE 1     END          AS tp_multi_flag,
+        CASE WHEN do_avg IS NULL OR do_avg = 0 THEN 0 ELSE 1      END         AS do_multi_flag,
+        CASE WHEN codmn_avg IS NULL OR codmn_avg < 0 THEN 0 ELSE 1  END       AS codmn_multi_flag
+
+FROM tmp_site_index_data1 a;
+
+CREATE TEMP TABLE tmp_site_index_data3 AS
+SELECT *,
+       GREATEST(actual_nh3n_category,actual_tp_category,actual_do_category,actual_codmn_category)      AS actual_waq_category,
+       GREATEST(general_nh3n_category,general_tp_category,general_do_category,general_codmn_category)  AS general_waq_category,
+       nh3n_exceed+tp_exceed+do_exceed+codmn_exceed                                                    AS exceed_index_qty,
+       (nh3n_exceed+tp_exceed+do_exceed+codmn_exceed)/4.0                                              AS exceed_index_rate,
+
+       CASE WHEN nh3n_multi_flag + tp_multi_flag + do_multi_flag + codmn_multi_flag = 0 THEN NULL ELSE
+       (coalesce(nh3n_exceed_multi,0)+coalesce(tp_exceed_multi,0)+coalesce(do_exceed_multi,0)+coalesce(codmn_exceed_multi,0))
+       /(nh3n_multi_flag + tp_multi_flag + do_multi_flag + codmn_multi_flag)  END                         AS wqi,
+       CASE WHEN nh3n_exceed+tp_exceed+do_exceed+codmn_exceed=0 THEN 1 ELSE 2 END                      AS waq_label
+FROM tmp_site_index_data2;
+
+--3.插入数据
+DELETE FROM wdp.rpt_site_mon_data_list WHERE data_time>=:'begin_time'::TIMESTAMP AND data_time<=:'end_time'::TIMESTAMP;
+
+INSERT INTO wdp.rpt_site_mon_data_list(
+       data_time,year,month,day,hour,
+       site_id,site_number,site_name,river_id,river_number,river_name,site_lng,site_lat,
+       target_waq_category,actual_waq_category,general_waq_category,
+       nh3n_avg,nh3n_exceed_multi,nh3n_exceed_rate,actual_nh3n_category,general_nh3n_category,
+       tp_avg,tp_exceed_multi,tp_exceed_rate,actual_tp_category,general_tp_category,
+       do_avg,do_exceed_multi,do_exceed_rate,actual_do_category,general_do_category,
+       codmn_avg,codmn_exceed_multi,codmn_exceed_rate,actual_codmn_category,general_codmn_category,
+       water_temp_avg,exceed_index_qty,exceed_index_rate,waq_label,
+       wqi,water_pollution_degree,
+       state,insert_time,weather_state,rainfall,temperature,RH,tide_datum_plane,tide_height
+)
+SELECT
+       a.data_time,to_char(a.data_time,'yyyy')::int,to_char(a.data_time,'mm')::int,to_char(a.data_time,'dd')::int,to_char(a.data_time,'hh24')::int,
+       site_id,site_number,site_name,river_id,river_number,river_name,site_lng,site_lat,
+       river_category,actual_waq_category,general_waq_category,
+       nh3n_avg,nh3n_exceed_multi,nh3n_exceed_rate,actual_nh3n_category,general_nh3n_category,
+       tp_avg,tp_exceed_multi,tp_exceed_rate,actual_tp_category,general_tp_category,
+       do_avg,do_exceed_multi,do_exceed_rate,actual_do_category,general_do_category,
+       codmn_avg,codmn_exceed_multi,codmn_exceed_rate,actual_codmn_category,general_codmn_category,
+       water_temp_avg,exceed_index_qty,exceed_index_rate,waq_label,
+       wqi,
+       CASE WHEN wqi <=0.8 THEN 1
+            WHEN wqi > 0.8 AND wqi <= 1 THEN 2
+            WHEN wqi > 1   AND wqi <= 2 THEN 3
+            ELSE 4 END,
+       state,now(),b.weather_state,b.rainfall,b.temperature,b.relative_humidity,
+       c.tide_datum_plane,c.tide_height
+
+FROM tmp_site_index_data3 a
+LEFT JOIN wdp.gd_weather_hour b ON a.data_time = b.data_time
+LEFT JOIN (SELECT data_time,tide_datum_plane,tide_height FROM wdp.rpt_tide_height_h WHERE city_name = '广州') c ON a.data_time = c.data_time
